@@ -3,9 +3,8 @@ from __future__ import annotations
 import discord
 from discord import app_commands
 from discord.ext import commands
-from functions import format_list
+from utils import format_list
 from dotenv import load_dotenv
-from traceback import print_exception
 import os
 
 load_dotenv()
@@ -60,7 +59,7 @@ class ErrorHandler(commands.Cog):
 			await interaction.response.send_message(f"`{e.value}` is not a member of this server!", ephemeral=True)
 		else:
 			await self.bot.send_unhandled_error(e, interaction=interaction)
-			print_exception(e)
+
 
 
 	@staticmethod

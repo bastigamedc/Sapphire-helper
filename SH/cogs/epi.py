@@ -4,8 +4,9 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands, ui
 from dotenv import load_dotenv
-from functions import save_channel_permissions, get_channel_permissions, delete_channel_permissions, get_locked_channels, \
-    generate_random_id, check_time_more_than
+from datetime import timedelta
+from utils import save_channel_permissions, get_channel_permissions, delete_channel_permissions, get_locked_channels, \
+    generate_random_id, check_time_more_than, str_to_timedelta
 import aiohttp, json, os, asyncio, re, datetime
 from typing import Literal, Optional, Any, TYPE_CHECKING
 
@@ -66,8 +67,8 @@ class GetNotifiedView(ui.LayoutView):
         self.add_item(container)
 
 
-class select_channels(ui.ChannelSelect):
-    def __init__(self, action: str, reason: str, i: discord.Interaction, slowmode: int | None = None):
+class SelectChannels(ui.ChannelSelect):
+    def __init__(self, action: str, reason: str, i: discord.Interaction, slowmode: timedelta | None = None):
         super().__init__(
             channel_types=[discord.ChannelType.text, discord.ChannelType.forum],
             placeholder=f"Select channels to",
@@ -76,7 +77,7 @@ class select_channels(ui.ChannelSelect):
         )
         self.action = action
         self.reason = reason
-        self.slowmode = slowmode
+        self.slowmode: int = slowmode.seconds if slowmode is not None else 0
         self.i = i
 
     async def lock_channel(self, channel: discord.TextChannel|discord.ForumChannel, interaction: discord.Interaction):
@@ -146,12 +147,12 @@ class select_channels(ui.ChannelSelect):
                 case "slowmode":
                     await channel.edit(slowmode_delay=self.slowmode, reason=f"/slowmode used by {interaction.user.name} ({interaction.user.id}). Reason: {self.reason}")
                     if self.slowmode > 0:
-                        await interaction.followup.send(f"Successfully set slowmode in {channel.mention} to {self.slowmode} seconds with reason: {self.reason}", ephemeral=True)
+                        await interaction.followup.send(f"Successfully set slowmode in {channel.mention} to {self.slowmode}s with reason: {self.reason}", ephemeral=True)
                     elif self.slowmode == 0:
                         await interaction.followup.send(f"Successfully disabled slowmode in {channel.mention}!", ephemeral=True)
                     successful.append(channel.id)
         if successful: # Check that channels were successfully edited
-            action_str = self.action + "ed" if self.slowmode is None else f"set slowmode to {self.slowmode}" if self.slowmode > 0 else "disabled slowmode"
+            action_str = self.action + "ed" if self.slowmode is None else f"set slowmode to {self.slowmode}s" if self.slowmode > 0 else "disabled slowmode"
             await interaction.client.send_log(EPI_LOG_THREAD_ID, content=f"{interaction.user.mention} {action_str} in {', '.join([f'<#{c}>' for c in successful])}. Reason: {self.reason}")
             await self.i.edit_original_response(view=None)
 
@@ -261,8 +262,8 @@ class EPI(commands.Cog):
         self.epi_data.is_being_executed = False
 
     async def disable_sticky_message(self):
-        while self.epi_data.is_being_executed:
-            await asyncio.sleep(1) # self.is_being_executed is true at lines 196-197 - async handle_sticky_message, when the previous sticky message is deleted and the new one is being sent. 1 should probably be enough for these things to happen
+        if self.epi_data.sticky_task is not None:
+            self.epi_data.sticky_task.cancel()
 
         if self.epi_data.sticky_message is not None:
             try:
@@ -275,6 +276,7 @@ class EPI(commands.Cog):
 
     async def cog_unload(self):
         self.ping_status_page.cancel()
+        await self.disable_sticky_message()
 
     @group.command(name="enable", description="Enables EPI mode with the given text/message id")
     @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
@@ -411,21 +413,6 @@ class EPI(commands.Cog):
         await interaction.followup.send(f"Are you sure you want to disable EPI mode? This will ping `{len(self.epi_data.users)}` user(s) that clicked the 'Notify me when this issue is resolved' button.\n-# Dismiss this message to cancel.",
                                         view=view, ephemeral=True)
 
-    @group.command(name="view", description="View the current EPI mode status")
-    @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
-    async def epi_view(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if not self.epi_data:
-            await interaction.followup.send(content="EPI mode is not currently enabled! Run the command again when EPI mode is activated.")
-            return
-
-        started_at = f"<t:{self.epi_data.started_at}:f>" # type: ignore
-        status_message_url = self.epi_data.status_message.jump_url if self.epi_data.status_message else "Not Set"
-        message = self.epi_data.message or "Not set"
-        is_sticky = self.epi_data.sticky_message is not None
-
-        await interaction.followup.send(f"- Started at: {started_at}\n- Custom message: {message}\n- Status message: {status_message_url}\n- User count: {len(self.epi_data.users)}\n- Sticky: {is_sticky}")
-
     @group.command(name="edit", description="Edit current EPI information")
     @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
     @app_commands.describe(message="A custom text message to be displayed. Leave empty to not edit or '-' to remove.", status_message_id="ID of a message from #status to be displayed. Leave empty to not edit or '-' to remove", sticky="Should a sticky message be created in #general? Leave empty to not edit.")
@@ -506,7 +493,7 @@ class EPI(commands.Cog):
     async def lock(self, interaction: discord.Interaction, reason: app_commands.Range[str, 1, 200]):
         await interaction.response.defer(ephemeral=True)
         view = ui.View()
-        view.add_item(select_channels("lock", reason, interaction))
+        view.add_item(SelectChannels("lock", reason, interaction))
         await interaction.followup.send(content="Select the channels to be locked below.\n-# Minimum of 1, maximum of 5.", view=view)
                 
     @app_commands.command(name="unlock", description="Unlock the given channels through the select menu sent. Should only be used in emergencies.")
@@ -515,16 +502,26 @@ class EPI(commands.Cog):
     async def unlock(self, interaction: discord.Interaction, reason: app_commands.Range[str, 1, 200]):
         await interaction.response.defer(ephemeral=True)
         view = ui.View()
-        view.add_item(select_channels("unlock", reason, interaction))
+        view.add_item(SelectChannels("unlock", reason, interaction))
         await interaction.followup.send("Select the channels that should be unlocked below.\n-# Minimum of 1, maximum of 5.", view=view, ephemeral=True)
 
     @app_commands.command(name="slowmode", description="Set a slowmode to channels using the select menu sent. Should only be used in emergencies.")
-    @app_commands.describe(time="The new slowmode time for the channel, in seconds. Max 21600. Put 0 to disable slowmode.", reason="What's the reason for this slowmode?")
+    @app_commands.describe(duration="The new slowmode for the channel (10s | 50m | 1m, 30s)", reason="What's the reason for this slowmode?")
     @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
-    async def slowmode(self, interaction: discord.Interaction, time: app_commands.Range[int, 0, 21600], reason: app_commands.Range[str, 1, 200]):
+    async def slowmode(self, interaction: discord.Interaction, duration: str, reason: app_commands.Range[str, 1, 200]):
         await interaction.response.defer(ephemeral=True)
+        try:
+            td = str_to_timedelta(duration)
+        except ValueError:
+            await interaction.followup.send(f"`{duration}` is not a valid duration. (E.g: 10s | 30m | 1m, 30s)", ephemeral=True)
+            return
+
+        if td.seconds > (60 * 60 * 6): # 6 hours
+            await interaction.followup.send(f"Slowmode cannot be longer than 6 hours!", ephemeral=True)
+            return
+
         view = ui.View()
-        view.add_item(select_channels("slowmode", reason,interaction ,time))
+        view.add_item(SelectChannels("slowmode", reason, interaction, td))
         await interaction.followup.send(content="Select the channels where the given slowmode should be applied below.\n-# Minimum of 1, maximum of 5.", view=view)
 
     async def set_webhook_page(self, partial_channel: discord.PartialMessageable) -> None:
@@ -741,14 +738,15 @@ class EPI(commands.Cog):
                 self.epi_data.status_page = req.status == 200 # true if the status is 200 - OK, else false
 
 
-    @group.command(name="debug", description="Get debug information on EPI and paging")
+    @group.command(name="debug_info", description="Get debug information on EPI and paging")
+    @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, DEVELOPERS_ROLE_ID, MODERATORS_ROLE_ID)
     async def epi_debug(self, interaction: discord.Interaction):
         container = ui.Container()
 
         epi_info = (f"- Enabled: `{self.epi_data._enabled}`",
                     f"- *Sticky* Msg: {self.epi_data.sticky_message.jump_url}" if self.epi_data.sticky_message else f"- *Sticky* Msg: `None`",
                     f"- *Status* Msg: {self.epi_data.status_message.jump_url}" if self.epi_data.status_message else f"- *Status* Msg: `None`",
-                    f"- Message: *{self.epi_data.message}*",
+                    f"- Custom Message: *{self.epi_data.message}*",
                     f"- No. of users: `{len(self.epi_data.users)}`",
                     f"- Status Page: `{self.epi_data.status_page}`",
                     f"- No. of thread_msg_mapping: `{len(self.epi_data.thread_to_msgs_map)}`")

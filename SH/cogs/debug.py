@@ -3,7 +3,7 @@ from __future__ import annotations
 import discord
 from discord.ext import commands
 from discord import app_commands
-import functions
+import utils
 from discord import ui, CheckboxGroupOption
 from discord.utils import snowflake_time, format_dt
 from datetime import datetime, UTC
@@ -77,7 +77,7 @@ class EvalSqlModal(ui.Modal):
         await interaction.response.defer()
 
         sql_cmd_input = self.sql_cmd.component.value
-        sql_result = str(await functions.execute_sql(sql_cmd_input.strip()))
+        sql_result = str(await utils.execute_sql(sql_cmd_input.strip()))
         await interaction.followup.send(f"```json\n{sql_result[0:1950]}```")
 
 class GlobalCacheModal(ui.Modal):
@@ -108,7 +108,7 @@ class GlobalCacheModal(ui.Modal):
         assert(isinstance(self.owner_input.component, ui.UserSelect))
         assert(isinstance(self.debug_type.component, ui.CheckboxGroup))
 
-        debug_type: Literal['clear', 'view', 'add', 'remove', 'check'] = self.debug_type.component.values[0]
+        debug_type: Literal['clear', 'view', 'add', 'remove', 'check'] = self.debug_type.component.values[0] # type: ignore
 
         if self.cache_type == 'PENDING_POSTS':
             cache = interaction.client.pending_posts
@@ -117,7 +117,7 @@ class GlobalCacheModal(ui.Modal):
 
         if debug_type == "clear":
             cache.clear()
-            await interaction.client.send_log(ALERTS_THREAD_ID, content=f"{self.cache_type} cache has been cleared by {interaction.user.mention}")
+            await interaction.client.send_log(ALERTS_THREAD_ID, content=f"`{self.cache_type}` cache has been cleared by {interaction.user.mention}")
             await interaction.followup.send(f"{self.cache_type} cache has been cleared!", ephemeral=True)
             return
         elif debug_type == "view":
@@ -144,24 +144,26 @@ class GlobalCacheModal(ui.Modal):
 
         if debug_type == "add":
             if self.cache_type == 'RTDR':
+                if post.owner_id != interaction.client.user.id:
+                    await interaction.followup.send("This post must be created by Sapphire Helper in order for it to be a RTDR post!", ephemeral=True)
+                    return
                 if not self.owner_input.component.values:
                     await interaction.followup.send(f"A user is needed in order to add a post to RTDR!", ephemeral=True)
                     return
+
                 owner = self.owner_input.component.values[0]
                 cache[post_id] = owner.id
                 await interaction.followup.send(f"Successfully added <#{post_id}> to RTDR cache with {owner.mention} ({owner.id}) as owner.", ephemeral=True)
-                return
             else:
                 cache[post_id] = int(datetime.now(UTC).timestamp())
                 await interaction.followup.send(f"Successfully added <#{post_id}> to PENDING_POSTS cache.", ephemeral=True)
-                return
         elif debug_type == "remove":
             try:
                 del cache[post_id]
             except KeyError:
                 await interaction.followup.send(f"<#{post_id}> ({post_id}) is not in {self.cache_type} cache.", ephemeral=True)
-                return
-            await interaction.followup.send(f"Successfully removed <#{post_id}> ({post_id}) from {self.cache_type} cache.", ephemeral=True)
+            else:
+                await interaction.followup.send(f"Successfully removed <#{post_id}> ({post_id}) from {self.cache_type} cache.", ephemeral=True)
         else:
             in_cache = "is" if post_id in cache else "is not"
             await interaction.followup.send(f"<#{post_id}> ({post_id}) {in_cache} in {self.cache_type} cache.", ephemeral=True)
@@ -177,7 +179,7 @@ class DebugCog(commands.Cog):
     @app_commands.describe(post="The post to debug")
     @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
     async def debug_post(self, interaction: discord.Interaction, post: app_commands.AppCommandThread): # AppCommandThread is needed as .Thread can't resolve if the post is archived
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         is_pending = post.id in self.bot.pending_posts
         if is_pending:
             pending_post_timestamp = self.bot.pending_posts[post.id]
@@ -187,7 +189,8 @@ class DebugCog(commands.Cog):
         owner_id = await self.bot.get_post_owner_id(post)
         await interaction.followup.send(view=DebugPostView(post, is_pending=is_pending, pending_post_timestamp=pending_post_timestamp,
                                                            owner_id=owner_id),
-                                                           allowed_mentions=discord.AllowedMentions.none())
+                                                           allowed_mentions=discord.AllowedMentions.none(),
+                                                           ephemeral=True)
 
     @debug_group_cmd.command(name="eval_sql", description="Execute an SQL command")
     @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
@@ -198,7 +201,7 @@ class DebugCog(commands.Cog):
     @app_commands.checks.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
     async def debug_db(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        await functions.setup_db()
+        await utils.setup_db()
         await interaction.followup.send("Success!\n", ephemeral=True)
 
 

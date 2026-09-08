@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import discord
 from discord.ext import commands, tasks
-from functions import check_time_more_than, generate_random_id
+from utils import check_time_more_than, generate_random_id
 import random
 import asyncio
 from discord import ui
 from discord import app_commands
 from datetime import timedelta
+from time import perf_counter
 import os
 from dotenv import load_dotenv
 from typing import TYPE_CHECKING
@@ -34,7 +35,7 @@ class CloseNowRow(ui.ActionRow):
         super().__init__()
         self.is_owner: bool = False
 
-    @ui.button(label="Issue Resolved? Close Post Now", style=discord.ButtonStyle.green, custom_id="remind-close-now")
+    @ui.button(label="Issue Resolved", style=discord.ButtonStyle.green, custom_id="remind-close-now")
     async def on_close_now_click(self, interaction: discord.Interaction[SHBot], _: ui.Button):
         text_display: discord.TextDisplay = ui.LayoutView.from_message(interaction.message).find_item(10) # type: ignore
         new_view = discord.ui.LayoutView().add_item(ui.Container(ui.TextDisplay(f"~~{text_display.content}~~"), ui.Separator(), ui.TextDisplay(f"-# Closed by {interaction.user}")))
@@ -57,7 +58,7 @@ class CloseNowRow(ui.ActionRow):
         interaction.client.remove_post_from_rtdr(interaction.channel_id)
 
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.red, custom_id="remind-cancel")
+    @ui.button(label="Still need help", style=discord.ButtonStyle.red, custom_id="remind-cancel")
     async def on_cancel_click(self, interaction: discord.Interaction[SHBot], _: ui.Button):
         text_display: discord.TextDisplay = ui.LayoutView.from_message(interaction.message).find_item(10) # type: ignore
         footer = f"-# Cancelled by {interaction.user}"
@@ -68,7 +69,7 @@ class CloseNowRow(ui.ActionRow):
         interaction.client.remove_post_from_pending(interaction.channel_id)
 
         if self.is_owner:
-            description = "Please send a message here explaining what you still need help with."
+            description = f"Heya {interaction.user.mention}, please send a message here explaining what you still need help with."
             footer = f"-# When the issue is resolved, you may use </solved:{await interaction.client.get_solved_id()}> to mark it as solved."
             view = ui.LayoutView().add_item(ui.Container(ui.TextDisplay(description), ui.Separator(), ui.TextDisplay(footer)))
             await interaction.message.reply(view=view)
@@ -127,10 +128,49 @@ class Reminders(commands.Cog):
         self.bot.add_view(CloseNowView())
 
     async def cog_load(self):
+        # Check that the bot was recently started (i.e pending_posts would be cleared from cache)
+        # And that pending posts is empty
+        if ((perf_counter() - self.bot.uptime) <= 5) and not self.bot.pending_posts:
+            await self.restore_pending_posts()
+
         self.reminders_loop.start()
 
     async def cog_unload(self):
         self.reminders_loop.cancel()
+
+    async def restore_pending_posts(self):
+        """
+        Restores pending_posts that were cleared from cache
+        when the bot was completely restarted.
+        """
+        suport_channel = self.bot.get_channel(SUPPORT_CHANNEL_ID) or await self.bot.fetch_channel(SUPPORT_CHANNEL_ID)
+
+        for post in await suport_channel.guild.active_threads():
+            if post.id in self.bot.pending_posts or not post.last_message_id:
+                continue
+
+            # posts must at least be a day old for a reminder to be sent!
+            if not check_time_more_than(snowflake_time(post.id).timestamp(), timedelta(days=1)):
+                continue
+
+            if not self.reminders_filter(post) or self.bot.user.id not in [member.id for member in post.members]:
+                continue
+
+            try:
+                last_message = post.last_message or await post.fetch_message(post.last_message_id)
+            except discord.HTTPException:
+                continue
+            
+            if last_message.author.id != self.bot.user.id or not last_message.flags.components_v2:
+                continue
+
+            for component in last_message.components:
+                if not isinstance(component, discord.Container):
+                    continue
+                for child in component.children:
+                    if isinstance(child, discord.TextDisplay) and "it seems like your last message was sent more than" in child.content:
+                        self.bot.add_post_to_pending(post.id, timestamp=int(last_message.created_at.timestamp()))
+                        break
 
     def get_reminder_next_iteration(self) -> str:
         """
@@ -277,7 +317,7 @@ class Reminders(commands.Cog):
 
 
     async def close_pending_posts(self):
-        for post_id, inserted_at in self.bot.pending_posts.items():
+        for post_id, inserted_at in tuple(self.bot.pending_posts.items()): # tuple to avoid modifying while iterating through the dictionary
             # only close posts that have been pending for > 1 day
             if not check_time_more_than(inserted_at, timedelta(days=1)):
                 continue
@@ -372,6 +412,13 @@ class Reminders(commands.Cog):
 
         container = ui.Container(ui.TextDisplay(content[0:4000]))
         await interaction.followup.send(view=ui.LayoutView().add_item(container), ephemeral=True)
+
+    @reminders_cmd_group.command(name="restore_pending_posts", description="Manually restore pending posts. Note that this should already be called at startup")
+    @app_commands.checks.has_any_role(MODERATORS_ROLE_ID, EXPERTS_ROLE_ID, DEVELOPERS_ROLE_ID)
+    async def reminders_restore_pending_posts_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.restore_pending_posts()
+        await interaction.followup.send(f"Success! Use `/debug global_cache` to check all current pending posts.", ephemeral=True)
 
 async def setup(bot: SHBot):
     await bot.add_cog(Reminders(bot))

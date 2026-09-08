@@ -5,7 +5,7 @@ from discord.ext import commands
 from discord import app_commands, ui
 from discord.utils import format_dt
 
-from functions import  check_time_more_than, str_to_timedelta
+from utils import check_time_more_than, str_to_timedelta
 from datetime import datetime, timedelta, UTC
 import aiohttp
 import asyncio
@@ -212,6 +212,12 @@ class Websocket:
 
                 except asyncio.CancelledError:
                     raise
+
+                except aiohttp.ClientResponseError as e:
+                    if e.status == 502:
+                        await self.cog.bot.send_log(ALERTS_THREAD_ID, content=f"An error occurred: {e}") # no pings for this
+                    else:
+                        await self.cog.bot.send_unhandled_error(e)
 
                 except Exception as e:
                     await self.cog.bot.send_unhandled_error(e)
