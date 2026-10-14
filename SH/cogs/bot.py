@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from main import SHBot
+    from epi import EPI
 
 load_dotenv()
 
@@ -44,6 +45,10 @@ class Bot(commands.Cog):
     @commands.command(name="restart")
     @commands.has_any_role(EXPERTS_ROLE_ID, MODERATORS_ROLE_ID, DEVELOPERS_ROLE_ID)
     async def restart(self, ctx: commands.Context):
+        cog: EPI = self.bot.get_cog("EPI") # type: ignore
+        if cog.epi_data:
+            await ctx.send("EPI is currently enabled, please disable it first before restarting!", delete_after=10)
+            return
         cogs_dir = Path(__file__).parent
         extensions = os.listdir(cogs_dir)
         for filename in extensions:
@@ -68,7 +73,7 @@ class Bot(commands.Cog):
         view = ui.LayoutView()
         container = ui.Container(accent_colour=0xA06BE6)
 
-        title = ui.TextDisplay("## [Sapphire helper | Version 6.2](https://github.com/kiki0124/sapphire-helper)")
+        title = ui.TextDisplay("## [Sapphire Helper | Version 6.3](https://github.com/kiki0124/sapphire-helper)")
         info_text = (f"- **CPU Count:** {os.cpu_count()}",
                      f"- **CPU Load:** {psutil.cpu_percent()}%",
                      f"- **Available memory:** {str(round(psutil.virtual_memory()[0]/1000000000))}GB",

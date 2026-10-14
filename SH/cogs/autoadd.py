@@ -6,7 +6,7 @@ import re
 import random
 import os
 from dotenv import load_dotenv
-from functions import generate_random_id
+from utils import generate_random_id, MaxCache
 from discord import ui
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -25,6 +25,7 @@ EXPERTS_ROLE_ID = int(os.getenv('EXPERTS_ROLE_ID'))
 MODERATORS_ROLE_ID = int(os.getenv('MODERATORS_ROLE_ID'))
 APPEAL_GG_TAG_ID = int(os.getenv("APPEAL_GG_TAG_ID"))
 DEVELOPERS_ROLE_ID = int(os.getenv("DEVELOPERS_ROLE_ID"))
+
 
 class ConfirmCloseButtons(ui.ActionRow):
     def __init__(self):
@@ -53,24 +54,28 @@ class ConfirmCloseButtons(ui.ActionRow):
         interaction.client.remove_post_from_rtdr(interaction.channel_id)
 
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.red, custom_id="auto-close-cancel")
+    @ui.button(label="Still need help", style=discord.ButtonStyle.red, custom_id="auto-close-cancel")
     async def on_cancel_click(self, interaction: discord.Interaction[SHBot], _: ui.Button):
         text_display: discord.TextDisplay = ui.LayoutView.from_message(interaction.message).find_item(10) # type: ignore
         footer = f"-# Cancelled by {interaction.user}"
         if SOLVED_TAG_ID in interaction.channel._applied_tags:
-            footer += f" | Use </unsolve:{await interaction.client.get_unsolve_id()}> to unsolve"
+            new_tags: list[discord.ForumTag] = [interaction.channel.parent.get_tag(NOT_SOLVED_TAG_ID)] # type: ignore
+            await interaction.channel.edit(applied_tags=new_tags)
+            await interaction.client.send_log(ALERTS_THREAD_ID, action_id=generate_random_id(),
+                                              post_mention=interaction.channel.mention, tags=new_tags,
+                                              context="Post unsolved, still need help button clicked")
         new_view = discord.ui.LayoutView().add_item(ui.Container(ui.TextDisplay(f"~~{text_display.content}~~"), ui.Separator(), ui.TextDisplay(footer)))
         await interaction.response.edit_message(view=new_view)
 
         if self.is_owner:
-            description = "Please send a message here explaining what you still need help with."
+            description = f"Heya {interaction.user.mention}, please send a message here explaining what you still need help with."
             footer = f"-# When the issue is resolved, you may use </solved:{await interaction.client.get_solved_id()}> to mark it as solved."
             view = ui.LayoutView().add_item(ui.Container(ui.TextDisplay(description), ui.Separator(visible=True), 
                                                             ui.TextDisplay(footer)))
             await interaction.message.reply(view=view)
 
     async def interaction_check(self, interaction: discord.Interaction[SHBot]) -> bool:
-        self.is_owner = interaction.user.id == await interaction.client.get_post_owner_id(interaction.channel)
+        self.is_owner = interaction.user.id == interaction.client.get_post_owner_id(interaction.channel)
         if not (self.is_owner or interaction.user.get_role(EXPERTS_ROLE_ID) or interaction.user.get_role(MODERATORS_ROLE_ID) or interaction.user.get_role(DEVELOPERS_ROLE_ID)):
             await interaction.response.send_message(content=f"Only <@&{EXPERTS_ROLE_ID}>, <@&{MODERATORS_ROLE_ID}>, <@&{DEVELOPERS_ROLE_ID}> and the post creator can use this!", ephemeral=True)
             return False
@@ -93,10 +98,41 @@ class ConfirmCloseView(ui.LayoutView):
         self.add_item(self.container)
 
 
+class MoreInfoView(ui.LayoutView):
+    def __init__(self):
+        super().__init__(timeout=None)
+        setup_container = ui.Container(
+            ui.TextDisplay("### Need help with setting up something?"),
+            ui.Separator(),
+            ui.TextDisplay("\n".join(("- Explain clearly what you are trying to setup/overall goall",
+                                    "- If you are facing problems:",
+                                    "  - What have you already tried?",
+                                    "  - Attach a screenshot/video of your current setup"))),
+            ui.TextDisplay("While waiting, you may check out *[Docs](https://docs.sapph.xyz/#/overview)/[Guides](https://docs.sapph.xyz/#/guides/)/[FAQ](https://docs.sapph.xyz/#/faq/)* for possible solutions!")
+            )
+
+        unexpected_issue_container = ui.Container(
+            ui.TextDisplay("### Faced an unexpected issue?"),
+            ui.Separator(),
+            ui.TextDisplay("\n".join(("- Explain exactly the issue you are facing",
+                                    "- What have you already tried?",
+                                    "- Check your [error log](https://dashboard.sapph.xyz/?redirect=/general-settings/error-log) & send a photo of it",
+                                    "- Show a screenshot/video of your setup"))),
+            ui.TextDisplay("While waiting, you may check out some *[Common Issues](https://docs.sapph.xyz/#/troubleshoot/)*"))
+
+
+        self.add_item(setup_container).add_item(unexpected_issue_container)
+
+
+SOLVED_POSITIVE_PATTERN = re.compile(r"solved|thanks?|works?|fixe?d|thx|tysm|\bty\b", re.IGNORECASE)
+SOLVED_NEGATIVE_PATTERN = re.compile(r"doe?s?n.?t|hasn.?t|isn.?t|not?\b|previously|however|but\b|before|won.?t|didn.?t|\?|can.?t|nothing|wouldn.?t|advance\b|ahead o?f? time|used to",
+                                     re.IGNORECASE)
+
 class AutoAdd(commands.Cog):
     def __init__(self, bot: SHBot):
         self.bot = bot
-        self.sent_post_ids = [] # A list of posts where the bot sent a suggestion message to use /solved
+        self.sent_cmd_suggestion_posts: MaxCache = MaxCache(250) # A set of post IDS where the bot sent a suggestion message to use /solved
+                                                                 # ~450-500 posts were added in a month, so 250 should be more than enough.
 
     @commands.Cog.listener('on_ready')
     async def add_persistent_view(self):
@@ -107,10 +143,26 @@ class AutoAdd(commands.Cog):
         if isinstance(message.channel, discord.Thread) and message.channel.parent_id == SUPPORT_CHANNEL_ID:
             if message.id == message.channel.id:
                 await self.on_thread_create(message.channel)
-            if message.channel.id not in self.sent_post_ids:
+            if message.channel.id not in self.sent_cmd_suggestion_posts:
                 await self.send_suggestion_message(message)
             if message.id != message.channel.id:
                 await self.replace_unanswered_tag(message)
+
+
+    async def maybe_send_incomplete_message(self, thread: discord.Thread) -> None:
+        starter_message = thread.starter_message
+        if not starter_message:
+            return
+        title_words = thread.name.split()
+        starter_message_words = starter_message.content.split()
+        if (
+            ((len(title_words) < 7 and len(starter_message_words) < 4)
+            or starter_message.content.casefold() == thread.name.casefold())
+            and thread.owner_id != self.bot.user.id # prevent the message from sending if it was sent via rtdr
+        ):
+            await starter_message.reply(view=MoreInfoView(), mention_author=True)
+            self.bot.incomplete_msg_posts.add(thread.id)
+
 
     async def on_thread_create(self, thread: discord.Thread):
         tags = thread.applied_tags
@@ -118,39 +170,23 @@ class AutoAdd(commands.Cog):
         action_id = generate_random_id()
         await thread.edit(applied_tags=tags, reason=f"ID: {action_id}. Auto-add unanswered tag to a new post.")
         await self.bot.send_log(ALERTS_THREAD_ID, action_id=action_id, post_mention=thread.mention, tags=tags, context="Auto add unanswered tag")
-        start_msg = thread.starter_message
-        content_len = len(start_msg.content) if start_msg.content else 0
-        if (
-            content_len + len(thread.name) < 25
-            or start_msg.content.casefold() == thread.name.casefold()
-            and thread.owner_id != self.bot.user.id # prevent the message from sending if it was sent via rtdr
-        ):
-            view = ui.LayoutView()
-            container = ui.Container()
-            view.add_item(container)
-            greets = ["Hi", "Hey", "Hello", "Hi there"]
-            container.add_item(
-                ui.TextDisplay(f"{random.choice(greets)}, please answer these questions if you haven't already, so we can help you faster.\n* What exactly is your question or the problem you're experiencing?\n* What have you already tried?\n* What are you trying to do / what is your overall goal?\n* If possible, please include a screenshot or screen recording of your setup.")
-            )
-            await thread.starter_message.reply(view=view, mention_author=True)
-            self.bot.incomplete_msg_posts.add(thread.id)
+        await self.maybe_send_incomplete_message(thread)
 
     async def send_suggestion_message(self, message: discord.Message):
-        if message.author.id == self.bot.user.id or message.author.id != await self.bot.get_post_owner_id(message.channel):
+        if message.author.id == self.bot.user.id or message.author.id != self.bot.get_post_owner_id(message.channel):
             return
         tags = message.channel._applied_tags
         if SOLVED_TAG_ID not in tags and NEED_DEV_REVIEW_TAG_ID not in tags and message.id != message.channel.id: # if the message id == message channel id it means that its a starter message of a thread.
-            pattern = r"solved|thanks?|works?|fixe?d|thx|tysm|\bty\b"
-            negative_pattern = r"doe?s?n.?t|hasn.?t|isn.?t|not?\b|but\b|before|won.?t|didn.?t|\?|can.?t|nothing|wouldn.?t|advance\b|ahead o?f? time"
-            if not re.search(negative_pattern, message.content, re.IGNORECASE) and re.search(pattern, message.content, re.IGNORECASE):
-                await message.reply(content=f"-# <:tree_corner:1272886415558049893>Command suggestion: </solved:{await self.bot.get_solved_id()}>")
-                self.sent_post_ids.append(message.channel.id)
+            if SOLVED_POSITIVE_PATTERN.search(message.content) is None or SOLVED_NEGATIVE_PATTERN.search(message.content) is not None:
+                return
+            await message.reply(content=f"-# <:tree_corner:1272886415558049893>Command suggestion: </solved:{await self.bot.get_solved_id()}>")
+            self.sent_cmd_suggestion_posts.add(message.channel.id)
 
     async def replace_unanswered_tag(self, message: discord.Message):
         if UNANSWERED_TAG_ID not in message.channel._applied_tags or message.author.id == self.bot.user.id:
             return
         applied_tags = message.channel.applied_tags
-        owner_id = await self.bot.get_post_owner_id(message.channel)
+        owner_id = self.bot.get_post_owner_id(message.channel)
         if message.author.id != owner_id:
             tags = [message.channel.parent.get_tag(NOT_SOLVED_TAG_ID)]
             cb = message.channel.parent.get_tag(CUSTOM_BRANDING_TAG_ID)
@@ -164,7 +200,7 @@ class AutoAdd(commands.Cog):
             await self.bot.send_log(ALERTS_THREAD_ID, action_id=action_id, post_mention=message.channel.mention, tags=tags, context="Replace unanswered tag with not solved")
 
     @commands.Cog.listener('on_raw_message_delete')
-    async def suggest_closing_post(self, payload: discord.RawMessageDeleteEvent):
+    async def suggest_close_on_starter_msg_delete(self, payload: discord.RawMessageDeleteEvent):
         message_channel = self.bot.get_channel(payload.channel_id)
         is_in_support = isinstance(message_channel, discord.Thread) and message_channel.parent_id == SUPPORT_CHANNEL_ID
         is_starter_message = payload.message_id == payload.channel_id
@@ -173,7 +209,7 @@ class AutoAdd(commands.Cog):
             tag_filters = NEED_DEV_REVIEW_TAG_ID not in tags and SOLVED_TAG_ID not in tags
             other_filters = not message_channel.locked and not message_channel.archived
             if tag_filters and other_filters:
-                owner_id = await self.bot.get_post_owner_id(message_channel)
+                owner_id = self.bot.get_post_owner_id(message_channel)
                 await message_channel.send(
                     view=ConfirmCloseView(post_author=owner_id)
                 )

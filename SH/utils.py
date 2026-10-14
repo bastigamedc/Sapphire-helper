@@ -4,9 +4,11 @@ from datetime import datetime, UTC, timedelta
 import asqlite as sql
 from string import ascii_letters, digits
 import random
-from typing import Any, TYPE_CHECKING
+from collections import OrderedDict
 from pathlib import Path
 
+
+from typing import Any, Generator, Iterable, TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from discord import User, Member
@@ -24,7 +26,8 @@ async def setup_db():
         async with conn.cursor() as cu:
             await cu.execute("CREATE TABLE IF NOT EXISTS reminder_waiting(post_id INTEGER PRIMARY KEY NOT NULL, timestamp INTEGER NOT NULL)")
             await cu.execute("CREATE TABLE IF NOT EXISTS locked_channels_permissions(channel_id INTEGER PRIMARY KEY NOT NULL, allow BIGINT, deny BIGINT)")
-            await cu.execute("CREATE TABLE IF NOT EXISTS tags(name STRING UNIQUE NOT NULL, content STRING NULL, creator_id INTEGER NOT NULL, created_ts INTEGER, uses INTEGER NOT NULL DEFAULT 0)")
+            await cu.execute("CREATE TABLE IF NOT EXISTS tags(name TEXT UNIQUE NOT NULL, content TEXT NULL, creator_id INTEGER NOT NULL, created_ts INTEGER, uses INTEGER NOT NULL DEFAULT 0)")
+            await cu.execute("CREATE TABLE IF NOT EXISTS cluster_tracker_notify(user_id INTEGER PRIMARY KEY NOT NULL)")
             await conn.commit()
 
 def generate_random_id() -> str:
@@ -87,6 +90,89 @@ def str_to_timedelta(duration: str) -> timedelta:
         else:
             raise ValueError(f"`{duration}` is invalid!")
     return td
+
+
+def format_mentions(user_ids: Iterable[int]) -> Generator[str]:
+    """
+    Yields mentions formatted. (E.g: '<@123>, <@456>')
+    """
+    mentions: list[str] = []
+    total_length = 0
+    for user_id in user_ids:
+        mention_fmt = f"<@{user_id}>"
+        mention_fmt_len = len(mention_fmt) + 2 # + 2 to include ', '
+        if (total_length + mention_fmt_len) > 2000:
+            yield ", ".join(mentions)
+            total_length = 0
+            mentions.clear()
+
+        mentions.append(mention_fmt)
+        total_length += mention_fmt_len
+
+    if mentions:
+        yield ", ".join(mentions)
+
+
+
+class MaxCache:
+    """
+    A custom cache that acts as a set/dict with a max size.
+    When the max size is reached upon adding new a item, the oldest item in the cache is removed.
+    """
+    __slots__ = ('_cache', 'max_size')
+    
+    def __init__(self, max_size: int) -> None:
+        self._cache = OrderedDict()
+        self.max_size = max_size
+
+    def __str__(self) -> str:
+        return str(self._cache)
+
+    def __repr__(self) -> str:
+        return repr(self._cache)
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def __bool__(self) -> bool:
+        return bool(self._cache)
+
+    def __contains__(self, item) -> bool:
+        return item in self._cache
+
+    
+    # dict-like functions
+    def __setitem__(self, key, value) -> None:
+        if len(self) == self.max_size:
+            self._cache.popitem(last=False)
+        self._cache[key] = value
+
+    def __getitem__(self, key) -> Any:
+        return self._cache[key]
+
+    def get(self, key, default = None) -> Any:
+        return self._cache.get(key, default)
+
+    def pop(self, key, default = None) -> Any:
+        return self._cache.pop(key, default)
+
+
+    def popitem(self, last: bool = True) -> Any:
+        return self._cache.popitem(last)
+
+
+    # set-like functions
+    def add(self, key) -> None:
+        """Add to the cache with the value as ``None``"""
+        self.__setitem__(key, None)
+
+    def remove(self, key) -> None:
+        """Remove element elem from the cache. Raises :exec:`KeyError` if elem is not contained in the cache."""
+        del self._cache[key]
+
+    def discard(self, key) -> None:
+        """Remove element elem from the cache if it is present."""
+        self._cache.pop(key, None)
 
 
 def sql_to_dict(sql_results: list[tuple]) -> dict[str, Any]:
@@ -198,8 +284,7 @@ async def get_locked_channels() -> list[int]:
             result = await cu.fetchall()
             if result:
                 return [row['channel_id'] for row in result]
-            else:
-                return []
+            return []
 
 async def delete_channel_permissions(channel_id: int) -> None:
     async with sql.connect(DB_PATH) as conn:
@@ -237,29 +322,46 @@ async def get_tag_data(name: str) -> dict[str, Any] | None:
     async with sql.connect(DB_PATH) as conn:
         result = await conn.fetchone("SELECT * FROM tags WHERE name=?", (name, ))
         if result:
-            return {
-                "name": result["name"],
-                "content": result["content"],
-                "creator_id": result["creator_id"],
-                "created_ts": result["created_ts"],
-                "uses": result["uses"]
-            }
+            return result # type: ignore
         return None
+
+async def update_tag_name(original_name: str, new_name: str):
+    async with sql.connect(DB_PATH) as conn:
+        await conn.execute("UPDATE tags SET name=? WHERE name=?", (new_name, original_name))
+        await conn.commit()
 
 async def update_tag_content(name: str, content: str):
     async with sql.connect(DB_PATH) as conn:
-        await conn.execute("UPDATE tags SET content=? WHERE name=?", (content, name,))
+        await conn.execute("UPDATE tags SET content=? WHERE name=?", (content, name))
         await conn.commit()
 
 async def get_most_used_tags() -> list[str]:
     """  
-    Returns the most used tags, max 25
+    Returns the most used tags, max 100
     """
     async with sql.connect(DB_PATH) as conn:
-        result = await conn.fetchall("SELECT name FROM tags ORDER BY uses LIMIT 25")
+        result = await conn.fetchall("SELECT name FROM tags ORDER BY uses LIMIT 100")
         return [tag['name'] for tag in result]
 
 async def delete_tag(name: str):
     async with sql.connect(DB_PATH) as conn:
         await conn.execute("DELETE FROM tags WHERE name=?", (name,))
         await conn.commit()
+
+
+# CLUSTER_TRACKER NOTIFY
+
+async def cluster_tracker_add(user_id: int) -> None:
+    async with sql.connect(DB_PATH) as conn:
+        await conn.execute("INSERT INTO cluster_tracker_notify (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING", (user_id ,))
+        await conn.commit()
+
+async def cluster_tracker_remove(user_id: int) -> None:
+    async with sql.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM cluster_tracker_notify WHERE user_id=?", (user_id ,))
+        await conn.commit()
+
+async def cluster_tracker_fetch_users() -> list[int]:
+    async with sql.connect(DB_PATH) as conn:
+        results = await conn.fetchall("SELECT user_id FROM cluster_tracker_notify")
+        return [result['user_id'] for result in results]

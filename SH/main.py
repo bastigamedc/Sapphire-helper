@@ -5,17 +5,17 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import os
 from dotenv import load_dotenv
-from functions import setup_db
+from utils import setup_db, MaxCache
 import unittest, test_functions
 from pathlib import Path
 import time
 from aiocache import cached
 from datetime import datetime, UTC
+from traceback import print_exception
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-PREFIX = os.getenv("PREFIX")
 ALERTS_THREAD_ID = int(os.getenv("ALERTS_THREAD_ID"))
 
 class SHBot(commands.Bot):
@@ -25,13 +25,13 @@ class SHBot(commands.Bot):
         intents.guild_messages = True
         intents.guilds = True
         intents.guild_reactions = True
-        super().__init__(PREFIX, help_command=None, intents=intents, strip_after_prefix=True, 
+        super().__init__(commands.when_mentioned, help_command=None, intents=intents, strip_after_prefix=True, 
                         allowed_contexts=app_commands.AppCommandContext(guild=True),
                         allowed_installs=app_commands.AppInstallationType(guild=True)
                          )
 
         self.alert_webhook_url: str | None = None
-        self.incomplete_msg_posts: set[int] = set() # list of the post ids
+        self.incomplete_msg_posts = MaxCache(70) # list of the post IDs | ~70 posts were added in ~1 month
         self.uptime = time.time() # used in cogs/bot,py
 
         self.rtdr_posts: dict[int, int] = {} # posts for RTDR
@@ -107,6 +107,7 @@ class SHBot(commands.Bot):
             content += f"\n### Tasks.Loop Error:\n>>> - {task._name}\n- Current iterations: `{task.current_loop}`"
         await self.send_log(ALERTS_THREAD_ID, content=content, 
                             allowed_mentions=discord.AllowedMentions(users=[discord.Object(1105414178937774150), discord.Object(802167689011134474)]))
+        print_exception(error)
 
     @cached()
     async def get_unsolve_id(self) -> int:
@@ -131,7 +132,7 @@ class SHBot(commands.Bot):
         return solved_id
 
 
-    async def get_post_owner_id(self, post: discord.Thread | app_commands.AppCommandThread) -> int:
+    def get_post_owner_id(self, post: discord.Thread | app_commands.AppCommandThread) -> int:
         """
         Helper function to get the owner ID for a support post. Returns `0` if not found.
         """
@@ -167,12 +168,17 @@ class SHBot(commands.Bot):
         self.rtdr_posts.pop(thread_id, None)
 
 
-    def add_post_to_pending(self, thread_id: int) -> None:
+    def add_post_to_pending(self, thread_id: int, *, timestamp: int | None = None) -> None:
         """
         Adds a post to the `pending_posts` cache and store the time it was inserted at.
+
+        Parameters
+        ----------
+        `timestamp`: `int`
+            When the post is added to pending. Defaults to the current timestamp.
         """
-        now = int(datetime.now(UTC).timestamp())
-        self.pending_posts[thread_id] = now
+        timestamp = timestamp or int(datetime.now(UTC).timestamp())
+        self.pending_posts[thread_id] = timestamp
 
     def remove_post_from_pending(self, thread_id: int) -> None:
         """
